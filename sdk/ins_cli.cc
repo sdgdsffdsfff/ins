@@ -31,6 +31,12 @@ void my_watch_callback(const WatchParam& param, SDKError error) {
     }
 }
 
+void session_timeout_callback(void * context) {
+    (void)context;
+    printf("session timeout\n");
+    exit(1);
+}
+
 int main(int argc, char* argv[]) {
     std::vector<std::string> members;
     InsSDK::ParseFlagFromArgs(argc, argv, &members);
@@ -133,6 +139,7 @@ int main(int argc, char* argv[]) {
             fprintf(stderr, "rpc error: %d", static_cast<int>(error));
             return 1;
         }
+        sdk.RegisterSessionTimeout(session_timeout_callback, NULL);
         while (!done) {
             sleep(1);
         }
@@ -147,6 +154,7 @@ int main(int argc, char* argv[]) {
             fprintf(stderr, "lock error: %d", static_cast<int>(error));
             return 1;
         }
+        sdk.RegisterSessionTimeout(session_timeout_callback, NULL);
         fprintf(stderr, "lock successful on %s\n", key.c_str());
         fprintf(stderr, "Press any key to release the lock.\n");
         getchar();

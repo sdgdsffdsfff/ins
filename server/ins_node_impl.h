@@ -211,6 +211,10 @@ private:
     void TriggerEventWithParent(const std::string& key,
                                 const std::string& value,
                                 bool deleted);
+    void TriggerEventBySessionAndKey(const std::string& session_id,
+                                     const std::string& key,
+                                     const std::string& value,
+                                     bool deleted);
     void RemoveEventBySessionAndKey(const std::string& session_id,
                                     const std::string& key);
     void DelBinlog(int64_t index);
@@ -257,7 +261,7 @@ private:
     CondVar* commit_cond_;
     WatchEventContainer watch_events_;
     Mutex watch_mu_;
-    std::map<std::string, std::vector<std::string> > session_locks_;
+    std::map<std::string, std::set<std::string> > session_locks_;
     Mutex session_locks_mu_;
     ThreadPool binlog_cleaner_;
     bool single_node_mode_;
