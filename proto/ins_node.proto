@@ -137,6 +137,7 @@ message LockResponse {
 message KeepAliveRequest {
     required string session_id = 1;
     optional string host_name = 2;
+    repeated string locks = 3;
 }
 
 message KeepAliveResponse {
@@ -145,8 +146,10 @@ message KeepAliveResponse {
 }
 
 message WatchRequest {
-    repeated string keys = 1;
+    required string key = 1;
     required string session_id = 2;
+    optional string old_value = 3;
+    optional bool key_exist = 4;
 }
 
 message WatchResponse {

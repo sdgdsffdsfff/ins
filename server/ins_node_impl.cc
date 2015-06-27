@@ -216,12 +216,12 @@ void InsNodeImpl::CommitIndexObserv() {
                     );
                     if (log_entry.op == kLock) {
                         MutexLock lock_sk(&session_locks_mu_);
-                        session_locks_[log_entry.value].push_back(log_entry.key);
+                        session_locks_[log_entry.value].insert(log_entry.key);
                     }
                     assert(s.ok());
                     break;
                 case kDel:
-                    LOG(DEBUG, "delete from data_store_, key: %s",
+                    LOG(INFO, "delete from data_store_, key: %s",
                         log_entry.key.c_str());
                     s = data_store_->Delete(leveldb::WriteOptions(),
                                              log_entry.key);
@@ -390,7 +390,7 @@ void InsNodeImpl::HeartBeatForReadCallback(
             } else{
                 context->response->set_hit(true);
                 context->response->set_success(true);
-                LOG(INFO, "get value: %s", real_value.c_str());
+                //LOG(INFO, "get value: %s", real_value.c_str());
                 context->response->set_value(real_value);
                 context->response->set_leader_id("");
             }
@@ -921,7 +921,7 @@ void InsNodeImpl::Get(::google::protobuf::RpcController* /*controller*/,
                 response->set_hit(true);
                 response->set_success(true);
                 response->set_value(real_value);
-                LOG(INFO, "get value: %s", real_value.c_str());
+                //LOG(INFO, "get value: %s", real_value.c_str());
                 response->set_leader_id("");
             }
         } else {
@@ -1236,6 +1236,13 @@ void InsNodeImpl::KeepAlive(::google::protobuf::RpcController* controller,
             id_index.replace(it, session);
         }
     }
+    {
+        MutexLock lock_sk(&session_locks_mu_);
+        session_locks_[session.session_id].clear();
+        for (int i = 0; i < request->locks_size(); i++) {
+            session_locks_[session.session_id].insert(request->locks(i));
+        }
+    }
     response->set_success(true);
     response->set_leader_id("");
     LOG(DEBUG, "recv session id: %s", session.session_id.c_str());
@@ -1291,9 +1298,10 @@ void InsNodeImpl::RemoveExpiredSessions() {
         for ( ; it != expired_sessions.end(); it++){
             std::string session_id = *it;
             if (session_locks_.find(session_id) != session_locks_.end()) {
-                std::vector<std::string>& keys = session_locks_[session_id];
-                for(size_t i = 0; i < keys.size(); i++) {
-                    unlock_keys.push_back(std::make_pair(keys[i], session_id));
+                std::set<std::string>& keys = session_locks_[session_id];
+                std::set<std::string>::iterator jt = keys.begin();
+                for(; jt != keys.end(); jt++) {
+                    unlock_keys.push_back(std::make_pair(*jt, session_id));
                 }
                 session_locks_.erase(session_id);
             }
@@ -1367,18 +1375,20 @@ void InsNodeImpl::TriggerEvent(const std::string& watch_key,
     if (it_start != key_idx.end() 
         && it_start->key == watch_key) {
         WatchEventKeyIndex::iterator it_end = key_idx.upper_bound(watch_key);
+        int event_count = 0;
         for (WatchEventKeyIndex::iterator it = it_start;
              it != it_end; it++) {
-            LOG(INFO, "trigger watch event: %s on %s",
-                it->key.c_str(), it->session_id.c_str());
             it->ack->response->set_watch_key(watch_key);
             it->ack->response->set_key(key);
             it->ack->response->set_value(value);
             it->ack->response->set_deleted(deleted);
             it->ack->response->set_success(true);
             it->ack->response->set_leader_id("");
+            event_count++;
         }
         key_idx.erase(it_start, it_end);
+        LOG(INFO, "trigger #%d watch event: %s",
+                  event_count, key.c_str());
     } else {
         LOG(DEBUG, "watch list: no such key : %s", key.c_str());
     }
@@ -1393,13 +1403,43 @@ void InsNodeImpl::RemoveEventBySessionAndKey(const std::string& session_id,
         && it_start->session_id == session_id) {
         WatchEventSessionIndex::iterator it_end = 
               session_idx.upper_bound(session_id);
-        WatchEventSessionIndex::iterator it_right = it_start;
         for (WatchEventSessionIndex::iterator it = it_start;
              it != it_end; ) {
             if (it->key == key) {
                  LOG(DEBUG, "remove watch event: %s on %s",
                      it->key.c_str(), it->session_id.c_str());
                 it->ack->response->set_canceled(true);
+                it = session_idx.erase(it);
+            } else {
+                it++;
+            }
+        }
+    }
+}
+
+
+void InsNodeImpl::TriggerEventBySessionAndKey(const std::string& session_id,
+                                              const std::string& key,
+                                              const std::string& value,
+                                              bool deleted) {
+    MutexLock lock(&watch_mu_);
+    WatchEventSessionIndex& session_idx = watch_events_.get<1>();
+    WatchEventSessionIndex::iterator it_start = session_idx.lower_bound(session_id);
+    if (it_start != session_idx.end() 
+        && it_start->session_id == session_id) {
+        WatchEventSessionIndex::iterator it_end = 
+              session_idx.upper_bound(session_id);
+        for (WatchEventSessionIndex::iterator it = it_start;
+             it != it_end; ) {
+            if (it->key == key) {
+                LOG(INFO, "trigger watch event: %s on %s",
+                           it->key.c_str(), it->session_id.c_str());
+                it->ack->response->set_watch_key(key);
+                it->ack->response->set_key(key);
+                it->ack->response->set_value(value);
+                it->ack->response->set_deleted(deleted);
+                it->ack->response->set_success(true);
+                it->ack->response->set_leader_id("");
                 it = session_idx.erase(it);
             } else {
                 it++;
@@ -1446,17 +1486,39 @@ void InsNodeImpl::Watch(::google::protobuf::RpcController* controller,
             return;
         } 
     }
+    
+    WatchAck::Ptr ack_obj(new WatchAck(response, done));
+    
+    std::string key = request->key();
     {
         MutexLock lock(&watch_mu_);
-        WatchAck::Ptr ack_obj(new WatchAck(response, done));
-        for(int i=0 ; i < request->keys_size(); i++) {
-            WatchEvent watch_event;
-            watch_event.key = request->keys(i);
-            //LOG(DEBUG, "watch key :%s", watch_event.key.c_str());
-            watch_event.session_id = request->session_id();
-            watch_event.ack = ack_obj;
-            RemoveEventBySessionAndKey(watch_event.session_id, watch_event.key);
-            watch_events_.insert(watch_event);
+        WatchEvent watch_event;
+        watch_event.key = key;
+        watch_event.session_id = request->session_id();
+        watch_event.ack = ack_obj;
+        RemoveEventBySessionAndKey(watch_event.session_id, watch_event.key);
+        watch_events_.insert(watch_event);
+    }
+    int64_t tm_now = ins_common::timer::get_micros(); 
+    if (tm_now - leader_start_timestamp_ > FLAGS_session_expire_timeout) {
+        leveldb::Status s;
+        std::string raw_value;
+        s = data_store_->Get(leveldb::ReadOptions(), key, &raw_value);
+        bool key_exist = s.ok();
+        std::string real_value;
+        LogOperation op;
+        ParseValue(raw_value, op, real_value);
+        if (real_value != request->old_value() || 
+            key_exist != request->key_exist()) {
+            LOG(INFO, "key:%s, new_v: %s, old_v:%s", 
+                key.c_str(), real_value.c_str(), request->old_value().c_str());
+            TriggerEventBySessionAndKey(request->session_id(),
+                                        key, real_value, s.IsNotFound());
+        } else if (op == kLock && IsExpiredSession(real_value)) {
+            LOG(INFO, "key(lock):%s, new_v: %s, old_v:%s", 
+                key.c_str(), real_value.c_str(), request->old_value().c_str());
+            TriggerEventBySessionAndKey(request->session_id(),
+                                        key, "", true);
         }
     }
 }

@@ -1,24 +1,31 @@
 # OPT ?= -O2 -DNDEBUG     # (A) Production use (optimized mode)
-OPT ?= -g2 -Wall          # (B) Debug mode, w/ full line-level debugging symbols
+OPT ?= -g2 -Wall -fPIC         # (B) Debug mode, w/ full line-level debugging symbols
 # OPT ?= -O2 -g2 -DNDEBUG # (C) Profiling mode: opt, but w/debugging symbols
 
 # Thirdparty
 SNAPPY_PATH=./thirdparty/snappy/
 PROTOBUF_PATH=./thirdparty/protobuf/
-PROTOC_PATH=
-PROTOC=$(PROTOC_PATH)protoc
-PBRPC_PATH=./thirdparty/sofa-pbrpc/output/
-BOOST_PATH=../boost/
+PROTOC_PATH=./thirdparty/protobuf/bin/
+PROTOC=protoc
+PBRPC_PATH ?=./thirdparty/sofa-pbrpc/output/
+BOOST_PATH=./thirdparty/boost/
+GFLAGS_PATH=./thirdparty/gflags/
+LEVELDB_PATH=./thirdparty/leveldb/
+PREFIX=/usr/local/
 
-INCLUDE_PATH = -I./ -I$(PROTOBUF_PATH)/include \
+INCLUDE_PATH = -I./ -I$(PREFIX)/include -I$(PROTOBUF_PATH)/include \
                -I$(PBRPC_PATH)/include \
                -I$(SNAPPY_PATH)/include \
+	       -I$(GFLAGS_PATH)/include \
+	       -I$(LEVELDB_PATH)/include \
                -I$(BOOST_PATH)/include
 
-LDFLAGS = -L$(PROTOBUF_PATH)/lib -lprotobuf \
-          -L$(PBRPC_PATH)/lib -lsofa-pbrpc \
+LDFLAGS = -L$(PREFIX)/lib -L$(PROTOBUF_PATH)/lib \
+          -L$(PBRPC_PATH)/lib -lsofa-pbrpc -lprotobuf \
           -L$(SNAPPY_PATH)/lib -lsnappy \
-          -lz -lleveldb -lgflags -lpthread -luuid
+          -L$(GFLAGS_PATH)/lib -lgflags \
+          -L$(LEVELDB_PATH)/lib -lleveldb \
+          -lz -lleveldb -lpthread -luuid
 
 CXXFLAGS += $(OPT)
 
@@ -42,10 +49,11 @@ SAMPLE_HEADER = $(wildcard sdk/*.h)
 FLAGS_OBJ = $(patsubst %.cc, %.o, $(wildcard server/flags.cc))
 COMMON_OBJ = $(patsubst %.cc, %.o, $(wildcard common/*.cc))
 OBJS = $(FLAGS_OBJ) $(COMMON_OBJ) $(PROTO_OBJ)
-
+SDK_OBJ = $(OBJS) $(patsubst %.cc, %.o, sdk/ins_sdk.cc)
 BIN = ins ins_cli sample
+LIB = libins_sdk.a
 
-all: $(BIN)
+all: $(BIN) cp $(LIB)
 
 # Depends
 $(INS_OBJ) $(INS_CLI_OBJ): $(PROTO_HEADER)
@@ -60,8 +68,11 @@ ins: $(INS_OBJ) $(OBJS)
 ins_cli: $(INS_CLI_OBJ) $(OBJS)
 	$(CXX) $(INS_CLI_OBJ) $(OBJS) -o $@ $(LDFLAGS)
 
-sample: $(SAMPLE_OBJ) $(OBJS) sdk/ins_sdk.o
-	$(CXX) $(SAMPLE_OBJ) $(OBJS) sdk/ins_sdk.o -o $@ $(LDFLAGS)
+sample: $(SAMPLE_OBJ) $(SDK_OBJ) $(LIB)
+	$(CXX) $(SAMPLE_OBJ) $(LIB) -o $@ $(LDFLAGS)
+
+$(LIB): $(SDK_OBJ)
+	ar -rs $@ $(SDK_OBJ)
 
 %.o: %.cc
 	$(CXX) $(CXXFLAGS) $(INCLUDE_PATH) -c $< -o $@
@@ -74,12 +85,31 @@ clean:
 	rm -rf $(INS_OBJ) $(INS_CLI_OBJ) $(OBJS)
 	rm -rf $(PROTO_SRC) $(PROTO_HEADER)
 
-cp: $(BIN)
+cp: $(BIN) $(LIB)
 	mkdir -p output/bin
+	mkdir -p output/lib
+	mkdir -p output/include
 	cp ins output/bin
 	cp ins_cli output/bin
 	cp sample output/bin
+	cp sdk/ins_sdk.h output/include
+	cp libins_sdk.a output/lib
+
+sdk: $(LIB)
+	mkdir -p output/include
+	mkdir -p output/lib
+	cp sdk/ins_sdk.h output/include
+	cp libins_sdk.a output/lib
+	
+install: $(LIB)
+	cp sdk/ins_sdk.h $(PREFIX)/include
+	cp $(LIB) $(PREFIX)/lib
+
+install_sdk: $(LIB)
+	cp sdk/ins_sdk.h $(PREFIX)/include
+	cp libins_sdk.a $(PREFIX)/lib
 
 .PHONY: test
 test:
 	echo "Test done"
+

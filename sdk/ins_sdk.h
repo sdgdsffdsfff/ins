@@ -92,19 +92,25 @@ public:
                      int64_t end_index, 
                      SDKError* error);
     std::string GetSessionID();
-    void RegisterSessionTimeout(void (*handle_session_timeout)());
+    void RegisterSessionTimeout(void (*handle_session_timeout)(void*), void* ctx );
     static std::string StatusToString(int32_t status);
 
 private:
     void Init(const std::vector<std::string>& members);
     void PrepareServerList(std::vector<std::string>& server_list);
     void KeepAliveTask();
-    void KeepWatchTask(const std::string& key);
+    void KeepWatchTask(const std::string& key, 
+                       const std::string& old_value,
+                       bool key_exist,
+                       std::string session_id,
+                       int64_t watch_id);
     void MakeSessionID();
     void KeepWatchCallback(const galaxy::ins::WatchRequest* request,
                            galaxy::ins::WatchResponse* response,
                            bool failed, int error,
-                           std::string server_id);
+                           std::string server_id,
+                           int64_t watch_id);
+    void BackupWatchTask(const std::string& key, int64_t watch_id);
     std::string leader_id_;
     std::string session_id_;
     std::vector<std::string> members_;
@@ -114,11 +120,15 @@ private:
     bool is_keep_alive_bg_;
     bool stop_;
     std::set<std::string> watch_keys_;
+    std::set<std::string> lock_keys_;
     std::map<std::string, WatchCallback> watch_cbs_;
     std::map<std::string, void*> watch_ctx_;
     ins_common::ThreadPool* keep_watch_pool_;
-    void (*handle_session_timeout_) ();
+    void (*handle_session_timeout_) (void*);
+    void * session_timeout_ctx_;
     int64_t last_succ_alive_timestamp_;
+    int64_t watch_task_id_;
+    std::set<int64_t> pending_watches_;
 };
 
 class ScanResult {
