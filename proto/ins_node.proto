@@ -14,14 +14,49 @@ enum LogOperation {
     kDel = 2;
     kLock = 3;
     kUnLock = 4;
+    kLogin = 5;
+    kLogout = 6;
+    kRegister = 7;
     kNop = 10;
 };
+
+enum Status {
+    kOk = 0;
+    kNotFound = 1;
+    kUnknownUser = 2;
+    kUserExists = 3;
+    kPasswordError = 4;
+    kPermissionDenied = 5;
+    kError = 10;
+};
+
+enum StatOperation {
+    kPutOp = 1;
+    kGetOp = 2;
+    kDeleteOp = 3;
+    kScanOp = 4;
+    kKeepAliveOp = 5;
+    kLockOp = 6;
+    kUnlockOp = 7;
+    kWatchOp = 8;
+}
+
+message UserInfo {
+    required string username = 1;
+    required string passwd = 2;
+}
 
 message Entry {
     required string key = 1;
     required bytes value = 2;
     required int64 term = 3;
     optional LogOperation op = 4;
+    optional string user = 5;
+}
+
+message StatInfo {
+    optional int64 current_stat = 1;
+    optional int64 average_stat = 2;
 }
 
 message AppendEntriesRequest {
@@ -37,6 +72,7 @@ message AppendEntriesResponse {
     required int64 current_term = 1;
     required bool success = 2;
     optional int64 log_length = 3;
+    optional bool is_busy = 4 [default = false]; 
 }
 
 message VoteRequest {
@@ -54,15 +90,18 @@ message VoteResponse {
 message PutRequest {
     required string key = 1;
     required bytes value = 2;
+    optional string uuid = 3;
 }
 
 message PutResponse {
     required bool success = 1;
     optional string leader_id = 2;
+    optional bool uuid_expired = 3;
 }
 
 message GetRequest {
     required string key = 1; 
+    optional string uuid = 2;
 }
 
 message GetResponse {
@@ -70,26 +109,31 @@ message GetResponse {
     optional bytes value = 2;
     optional string leader_id = 3;
     required bool success = 4;
+    optional bool uuid_expired = 5;
 }
 
 message DelRequest {
     required string key = 1;    
+    optional string uuid = 2;
 }
 
 message DelResponse {
     required bool success = 1;
     optional string leader_id = 2;
+    optional bool uuid_expired = 3;
 }
 
 
 message UnLockRequest {
     required string key = 1;
     required string session_id = 2;  
+    optional string uuid = 3;
 }
 
 message UnLockResponse {
     required bool success = 1;
     optional string leader_id = 2;
+    optional bool uuid_expired = 3;
 }
 
 message ShowStatusRequest {
@@ -107,8 +151,9 @@ message ShowStatusResponse {
 
 message ScanRequest {
     required string start_key = 1;
-    required string end_key = 2;
+    required bytes end_key = 2;
     required int32 size_limit = 3;    
+    optional string uuid = 4;
 }
 
 message ScanItem {
@@ -121,23 +166,27 @@ message ScanResponse {
     repeated ScanItem items = 2;
     optional string leader_id = 3;
     required bool success = 4;
+    optional bool uuid_expired = 5;
 }
 
 message LockRequest {
     required string key = 1;
     required string session_id = 2;
     optional string hostname = 3;
+    optional string uuid = 4;
 }
 
 message LockResponse {
     required bool success = 1;
     optional string leader_id = 2;
+    optional bool uuid_expired = 3;
 }
 
 message KeepAliveRequest {
     required string session_id = 1;
-    optional string host_name = 2;
+    optional string uuid = 2;
     repeated string locks = 3;
+    optional bool forward_from_leader = 4 [default = false];
 }
 
 message KeepAliveResponse {
@@ -148,18 +197,51 @@ message KeepAliveResponse {
 message WatchRequest {
     required string key = 1;
     required string session_id = 2;
-    optional string old_value = 3;
+    optional bytes old_value = 3;
     optional bool key_exist = 4;
+    optional string uuid = 5;
 }
 
 message WatchResponse {
     optional bool success = 1 [default = false];
     optional string leader_id = 2 [default = ""];
     optional string key = 3;
-    optional string value = 4;
+    optional bytes value = 4;
     optional bool deleted = 5;
     optional bool canceled = 6 [default = false];
     optional string watch_key = 7;
+    optional bool uuid_expired = 8;
+}
+
+message LoginRequest {
+    required string username = 1;
+    required string passwd = 2;
+//  optional string encrypt_method = 3;
+}
+
+message LoginResponse {
+    required Status status = 1;
+    optional string uuid = 2;
+    optional string leader_id = 3;
+}
+
+message LogoutRequest {
+    required string uuid = 1;
+}
+
+message LogoutResponse {
+    required Status status = 1;
+    optional string leader_id = 2;
+}
+
+message RegisterRequest {
+    required string username = 1;
+    required string passwd = 2;
+}
+
+message RegisterResponse {
+    required Status status = 1;
+    optional string leader_id = 2;
 }
 
 message CleanBinlogRequest {
@@ -168,6 +250,16 @@ message CleanBinlogRequest {
 
 message CleanBinlogResponse {
     required bool success = 1;
+}
+
+message RpcStatRequest {
+    // Return all stats if op is not given
+    repeated StatOperation op = 1;
+}
+
+message RpcStatResponse {
+    optional NodeStatus status = 1;    
+    repeated StatInfo stats = 2;
 }
 
 service InsNode {
@@ -180,8 +272,12 @@ service InsNode {
     rpc Lock(LockRequest) returns (LockResponse);
     rpc UnLock(UnLockRequest) returns (UnLockResponse);
     rpc Watch(WatchRequest) returns (WatchResponse);
+    rpc Login(LoginRequest) returns (LoginResponse);
+    rpc Logout(LogoutRequest) returns (LogoutResponse);
+    rpc Register(RegisterRequest) returns (RegisterResponse);
     rpc KeepAlive(KeepAliveRequest) returns (KeepAliveResponse);
     rpc ShowStatus(ShowStatusRequest) returns (ShowStatusResponse);
     rpc CleanBinlog(CleanBinlogRequest) returns (CleanBinlogResponse);
+    rpc RpcStat(RpcStatRequest) returns (RpcStatResponse);
 }
 

@@ -14,14 +14,20 @@ namespace ins {
 
 struct LogEntry {
     LogOperation op;
+    std::string user;
     std::string key;
     std::string value;
     int64_t term;
+    LogEntry() : op(kNop), user("") {
+    }
 };
 
 class BinLogger {
 public:
-    BinLogger(const std::string& data_dir);
+    BinLogger(const std::string& data_dir, 
+              bool compress = false,
+              int32_t block_size = 32748,
+              int32_t write_buffer_size = 33554432);
     ~BinLogger();
     int64_t GetLength();
     bool ReadSlot(int64_t slot_index, LogEntry* log_entry);
@@ -35,9 +41,11 @@ public:
     bool RemoveSlot(int64_t slot_index);
     static std::string IntToString(int64_t num);
     static int64_t StringToInt(const std::string& s);
+    void GetLastLogIndexAndTerm(int64_t* last_log_index, int64_t* last_log_term);
 private:
     leveldb::DB* db_;
     int64_t length_;
+    int64_t last_log_term_;
     Mutex mu_;
 };
 

@@ -7,6 +7,9 @@
 #include <boost/function.hpp>
 #include <boost/scoped_ptr.hpp>
 #include <gflags/gflags.h>
+#include <limits>
+#include <algorithm>
+#include <vector>
 #include "common/this_thread.h"
 #include "common/timer.h"
 #include "storage/meta.h"
@@ -20,35 +23,38 @@ DECLARE_int32(replication_retry_timespan);
 DECLARE_int32(elect_timeout_min);
 DECLARE_int32(elect_timeout_max);
 DECLARE_int64(session_expire_timeout);
+DECLARE_int32(ins_gc_interval);
+DECLARE_int32(max_write_pending);
+DECLARE_int32(max_commit_pending);
+DECLARE_bool(ins_binlog_compress);
+DECLARE_int32(ins_binlog_block_size);
+DECLARE_int32(ins_binlog_write_buffer_size);
+DECLARE_int32(performance_buffer_size);
 
 const std::string tag_last_applied_index = "#TAG_LAST_APPLIED_INDEX#";
 
 namespace galaxy {
 namespace ins {
 
-void GetHostName(std::string* hostname) {
-  struct utsname buf;
-  if (0 != uname(&buf)) {
-    *buf.nodename = '\0';
-  }
-  *hostname = buf.nodename;
-}
-
-InsNodeImpl::InsNodeImpl (std::string& server_id,
-                          const std::vector<std::string>& members
-                          ) : stop_(false),
-                              self_id_(server_id),
-                              current_term_(0),
-                              status_(kFollower),
-                              heartbeat_count_(0),
-                              meta_(NULL),
-                              binlogger_(NULL),
-                              replicatter_(FLAGS_max_cluster_size),
-                              heartbeat_read_timestamp_(0),
-                              in_safe_mode_(true),
-                              commit_index_(-1),
-                              last_applied_index_(-1),
-                              single_node_mode_(false){
+InsNodeImpl::InsNodeImpl(std::string& server_id,
+                         const std::vector<std::string>& members
+                         ) : stop_(false),
+                             self_id_(server_id),
+                             current_term_(0),
+                             status_(kFollower),
+                             heartbeat_count_(0),
+                             meta_(NULL),
+                             binlogger_(NULL),
+                             user_manager_(NULL),
+                             replicatter_(FLAGS_max_cluster_size),
+                             heartbeat_read_timestamp_(0),
+                             in_safe_mode_(true),
+                             server_start_timestamp_(0),
+                             commit_index_(-1),
+                             last_applied_index_(-1),
+                             single_node_mode_(false),
+                             last_safe_clean_index_(-1),
+                             perform_(FLAGS_performance_buffer_size) {
     srand(time(NULL));
     replication_cond_ = new CondVar(&mu_);
     commit_cond_ = new CondVar(&mu_);
@@ -78,32 +84,36 @@ InsNodeImpl::InsNodeImpl (std::string& server_id,
     }
     std::string sub_dir = self_id_;
     boost::replace_all(sub_dir, ":", "_");
-    
+
     meta_ = new Meta(FLAGS_ins_data_dir + "/" + sub_dir);
-    binlogger_ = new BinLogger(FLAGS_ins_binlog_dir + "/" + sub_dir);
+    binlogger_ = new BinLogger(FLAGS_ins_binlog_dir + "/" + sub_dir, 
+                               FLAGS_ins_binlog_compress,
+                               FLAGS_ins_binlog_block_size * 1024,
+                               FLAGS_ins_binlog_write_buffer_size * 1024 * 1024);
     current_term_ = meta_->ReadCurrentTerm();
     meta_->ReadVotedFor(voted_for_);
-    
+
     std::string data_store_path = FLAGS_ins_data_dir + "/" 
                                   + sub_dir + "/store" ;
-    leveldb::Options options;
-    options.create_if_missing = true;
-    leveldb::Status status = leveldb::DB::Open(options, 
-                                               data_store_path, &data_store_);
-    assert(status.ok());
+    data_store_ = new StorageManager(data_store_path);
+    UserInfo root = meta_->ReadRootInfo();
+    user_manager_ = new UserManager(data_store_path, root);
     std::string tag_value;
-    status = data_store_->Get(leveldb::ReadOptions(),
-                              tag_last_applied_index,
-                              &tag_value);
-    if (status.ok()) {
+    Status status = data_store_->Get(StorageManager::anonymous_user,
+                                     tag_last_applied_index,
+                                     &tag_value);
+    if (status == kOk) {
         last_applied_index_ =  BinLogger::StringToInt(tag_value);
     }
-
+    server_start_timestamp_ = ins_common::timer::get_micros();
     committer_.AddTask(boost::bind(&InsNodeImpl::CommitIndexObserv, this));
     MutexLock lock(&mu_);
     CheckLeaderCrash();
     session_checker_.AddTask( 
         boost::bind(&InsNodeImpl::RemoveExpiredSessions, this)
+    );
+    binlog_cleaner_.AddTask(
+        boost::bind(&InsNodeImpl::GarbageClean, this)
     );
 }
 
@@ -125,6 +135,8 @@ InsNodeImpl::~InsNodeImpl() {
         MutexLock lock(&mu_);
         delete meta_;
         delete binlogger_;
+        delete user_manager_;
+        delete data_store_;
     }
 }
 
@@ -153,17 +165,23 @@ void InsNodeImpl::ShowStatus(::google::protobuf::RpcController* /*controller*/,
                              const ::galaxy::ins::ShowStatusRequest* /*request*/,
                              ::galaxy::ins::ShowStatusResponse* response,
                              ::google::protobuf::Closure* done) {
-    MutexLock lock(&mu_);
+    LOG(DEBUG, "ShowStatus start");
     int64_t last_log_index;
     int64_t last_log_term;
     GetLastLogIndexAndTerm(&last_log_index, &last_log_term);
-    response->set_status(status_);
-    response->set_term(current_term_);    
-    response->set_last_log_index(last_log_index);
-    response->set_last_log_term(last_log_term);
-    response->set_commit_index(commit_index_);
-    response->set_last_applied(last_applied_index_);
+    LOG(DEBUG, "last_log_index: %ld, last_log_term: %d", 
+        last_log_index, last_log_term);
+    {
+        MutexLock lock(&mu_);
+        response->set_status(status_);
+        response->set_term(current_term_);    
+        response->set_last_log_index(last_log_index);
+        response->set_last_log_term(last_log_term);
+        response->set_commit_index(commit_index_);
+        response->set_last_applied(last_applied_index_);
+    }
     done->Run();
+    LOG(DEBUG, "ShowStatus done.");
 }
 
 void InsNodeImpl::TransToFollower(const char* msg, int64_t new_term) {
@@ -175,6 +193,14 @@ void InsNodeImpl::TransToFollower(const char* msg, int64_t new_term) {
     status_ = kFollower;
     current_term_ = new_term;
     meta_->WriteCurrentTerm(current_term_);
+}
+
+inline std::string InsNodeImpl::BindKeyAndUser(const std::string& user, const std::string& key) {
+    return user + "::" + key;
+}
+
+inline std::string InsNodeImpl::GetKeyFromEvent(const std::string& event_key) {
+    return event_key.substr(event_key.find_first_of(":") + 2); // len("::") = 2
 }
 
 void InsNodeImpl::CommitIndexObserv() {
@@ -196,71 +222,97 @@ void InsNodeImpl::CommitIndexObserv() {
             LogEntry log_entry;
             bool slot_ok = binlogger_->ReadSlot(i, &log_entry);
             assert(slot_ok);
-            leveldb::Status s;
+            Status s;
             std::string type_and_value;
+            std::string new_uuid;
             bool lock_succ = true;
+            Status log_status = kError;
             switch(log_entry.op) {
                 case kPut:
                 case kLock:
-                    LOG(DEBUG, "add to data_store_, key: %s, value: %s",
-                        log_entry.key.c_str(), log_entry.value.c_str());
+                    LOG(DEBUG, "add to data_store_, key: %s, value: %s, user: %s",
+                        log_entry.key.c_str(), log_entry.value.c_str(),
+                        log_entry.user.c_str());
                     type_and_value.append(1, static_cast<char>(log_entry.op));
                     type_and_value.append(log_entry.value);
-                    s = data_store_->Put(leveldb::WriteOptions(),
-                                         log_entry.key,
-                                         type_and_value);
+                    s = data_store_->Put(log_entry.user, log_entry.key, type_and_value);
                     event_trigger_.AddTask(
                         boost::bind(&InsNodeImpl::TriggerEventWithParent,
                                     this,
-                                    log_entry.key, log_entry.value, false)
+                                    BindKeyAndUser(log_entry.user, log_entry.key),
+                                    log_entry.value, false)
                     );
                     if (log_entry.op == kLock) {
                         MutexLock lock_sk(&session_locks_mu_);
                         session_locks_[log_entry.value].insert(log_entry.key);
                     }
-                    assert(s.ok());
+                    assert(s == kOk);
                     break;
                 case kDel:
                     LOG(INFO, "delete from data_store_, key: %s",
                         log_entry.key.c_str());
-                    s = data_store_->Delete(leveldb::WriteOptions(),
-                                             log_entry.key);
-                    assert(s.ok());
+                    s = data_store_->Delete(log_entry.user, log_entry.key);
+                    assert(s == kOk);
                     event_trigger_.AddTask(
                         boost::bind(&InsNodeImpl::TriggerEventWithParent,
                                     this,
-                                    log_entry.key, log_entry.value, true)
+                                    BindKeyAndUser(log_entry.user, log_entry.key),
+                                    log_entry.value, true)
                     );
                     break;
                 case kNop:
                     LOG(DEBUG, "kNop got, do nothing, key: %s", 
                               log_entry.key.c_str());
-                    nop_committed = true;
+                    {
+                        MutexLock locker(&mu_);
+                        if (log_entry.term == current_term_) {
+                            nop_committed = true;
+                        }
+                        LOG(INFO, "nop term: %ld, cur term: %ld", 
+                            log_entry.term, current_term_);
+                    }
                     break;
                 case kUnLock:
-                    {   
-                        std::string key = log_entry.key;
-                        std::string old_session = log_entry.value;
+                    {
+                        const std::string& key = log_entry.key;
+                        const std::string& old_session = log_entry.value;
                         std::string value;
-                        s = data_store_->Get(leveldb::ReadOptions(), key, &value);
-                        if (s.ok()) {
+                        s = data_store_->Get(log_entry.user, key, &value);
+                        if (s == kOk) {
                             std::string cur_session;
                             LogOperation op;
                             ParseValue(value, op, cur_session);
                             if (op == kLock && cur_session == old_session) { //DeleteIf
-                                s = data_store_->Delete(leveldb::WriteOptions(),
-                                                        key);
-                                assert(s.ok());
+                                s = data_store_->Delete(log_entry.user, key);
+                                assert(s == kOk);
                                 LOG(INFO, "unlock on %s", key.c_str());
                                 event_trigger_.AddTask(
                                   boost::bind(&InsNodeImpl::TriggerEventWithParent,
                                               this,
-                                              key, old_session, true)
+                                              BindKeyAndUser(log_entry.user, key),
+                                              old_session, true)
                                 );
                             }
                         }
                     }
                     break;
+                case kLogin:
+                    log_status = user_manager_->Login(log_entry.key,
+                                                      log_entry.value,
+                                                      log_entry.user);
+                    if (log_status == kOk) {
+                        new_uuid = log_entry.user;
+                        data_store_->OpenDatabase(log_entry.key);
+                    }
+                    break;
+                case kLogout:
+                    log_status = user_manager_->Logout(log_entry.user);
+                    break;
+                case kRegister:
+                    log_status = user_manager_->Register(log_entry.key, log_entry.value);
+                    break;
+                default:
+                    LOG(WARNING, "Unfamiliar op :%d", static_cast<int>(log_entry.op));
             }
             mu_.Lock();
             if (status_ == kLeader && nop_committed) {
@@ -294,18 +346,42 @@ void InsNodeImpl::CommitIndexObserv() {
                     ack.unlock_response->set_leader_id("");
                     ack.done->Run(); //client unlock ok;
                 }
+                if (ack.login_response) {
+                    ack.login_response->set_status(log_status);
+                    ack.login_response->set_uuid(new_uuid);
+                    ack.login_response->set_leader_id("");
+                    ack.done->Run();
+                }
+                if (ack.logout_response) {
+                    ack.logout_response->set_status(log_status);
+                    ack.logout_response->set_leader_id("");
+                    ack.done->Run();
+                }
+                if (ack.register_response) {
+                    ack.register_response->set_status(log_status);
+                    ack.register_response->set_leader_id("");
+                    ack.done->Run();
+                }
                 client_ack_.erase(i);
             }
             last_applied_index_ += 1;
-            leveldb::Status sp = data_store_->Put(leveldb::WriteOptions(),
-                                                  tag_last_applied_index, 
-                                                  BinLogger::IntToString(
-                                                    last_applied_index_));
-            assert(sp.ok());
+            Status sp = data_store_->Put(StorageManager::anonymous_user,
+                                         tag_last_applied_index, 
+                                         BinLogger::IntToString(last_applied_index_));
+            assert(sp == kOk);
             mu_.Unlock();
         }
         mu_.Lock();
     }
+}
+
+void InsNodeImpl::ForwardKeepAliveCallback(
+                                  const ::galaxy::ins::KeepAliveRequest* request,
+                                  ::galaxy::ins::KeepAliveResponse* response,
+                                  bool /*failed*/, int /*error*/) {
+    boost::scoped_ptr<const galaxy::ins::KeepAliveRequest> request_ptr(request);
+    boost::scoped_ptr<galaxy::ins::KeepAliveResponse> response_ptr(response);
+    LOG(DEBUG, "heartbeat from clients forwarded");
 }
 
 void InsNodeImpl::HearBeatCallback(const ::galaxy::ins::AppendEntriesRequest* request,
@@ -367,15 +443,16 @@ void InsNodeImpl::HeartBeatForReadCallback(
         context->err_count += 1;
     }
     if (context->succ_count > members_.size() / 2) {
-        std::string key = context->request->key();
+        const std::string& key = context->request->key();
+        const std::string& uuid = context->request->uuid();
         LOG(DEBUG, "client get key: %s", key.c_str());
-        leveldb::Status s;
+        Status s;
         std::string value;
-        s = data_store_->Get(leveldb::ReadOptions(), key, &value);
+        s = data_store_->Get(user_manager_->GetUsernameFromUuid(uuid), key, &value);
         std::string real_value;
         LogOperation op;
         ParseValue(value, op, real_value);
-        if (s.ok()) {
+        if (s == kOk) {
             if (op == kLock) {
                 if (IsExpiredSession(real_value)) {
                     context->response->set_hit(false);
@@ -480,7 +557,6 @@ void InsNodeImpl::TransToLeader() {
     status_ = kLeader;
     current_leader_ = self_id_;
     LOG(INFO, "I win the election, term:%d", current_term_);
-    leader_start_timestamp_ = ins_common::timer::get_micros();
     heart_beat_pool_.AddTask(
         boost::bind(&InsNodeImpl::BroadCastHeartBeat, this));
     StartReplicateLog();
@@ -511,15 +587,7 @@ void InsNodeImpl::VoteCallback(const ::galaxy::ins::VoteRequest* request,
 
 void InsNodeImpl::GetLastLogIndexAndTerm(int64_t* last_log_index,
                                          int64_t* last_log_term) {
-    mu_.AssertHeld();
-    *last_log_index = binlogger_->GetLength() - 1;
-    *last_log_term = -1;
-    if (*last_log_index >= 0) {
-        LogEntry log_entry;
-        bool slot_ok = binlogger_->ReadSlot(*last_log_index, &log_entry);
-        assert(slot_ok);
-        *last_log_term = log_entry.term;
-    }
+    binlogger_->GetLastLogIndexAndTerm(last_log_index, last_log_term);
 }
 
 void InsNodeImpl::TryToBeLeader() {
@@ -576,10 +644,9 @@ void InsNodeImpl::TryToBeLeader() {
     CheckLeaderCrash();
 }
 
-void InsNodeImpl::AppendEntries(::google::protobuf::RpcController* /*controller*/,
-                                const ::galaxy::ins::AppendEntriesRequest* request,
-                                ::galaxy::ins::AppendEntriesResponse* response,
-                                ::google::protobuf::Closure* done) {
+void InsNodeImpl::DoAppendEntries(const ::galaxy::ins::AppendEntriesRequest* request,
+                                  ::galaxy::ins::AppendEntriesResponse* response,
+                                  ::google::protobuf::Closure* done) {
     MutexLock lock(&mu_);
     if (request->term() >= current_term_) {
         status_ = kFollower;
@@ -608,6 +675,7 @@ void InsNodeImpl::AppendEntries(::google::protobuf::RpcController* /*controller*
                 done->Run();
                 return;
             }
+
             int64_t prev_log_term = -1;
             if (request->prev_log_index() >= 0) {
                 LogEntry prev_log_entry;
@@ -627,6 +695,17 @@ void InsNodeImpl::AppendEntries(::google::protobuf::RpcController* /*controller*
                 done->Run();
                 return;
             }
+            if (request->prev_log_index() - last_applied_index_ 
+                > FLAGS_max_commit_pending) {
+                response->set_current_term(current_term_);
+                response->set_success(false);
+                response->set_log_length(binlogger_->GetLength());
+                response->set_is_busy(true);
+                LOG(INFO, "[AppendEntries] speed to fast, %ld > %ld",
+                    request->prev_log_index(), last_applied_index_);
+                done->Run();
+                return;
+            }
             if (binlogger_->GetLength() > request->prev_log_index() + 1) {
                 int64_t old_length = binlogger_->GetLength();
                 binlogger_->Truncate(request->prev_log_index() );
@@ -634,7 +713,9 @@ void InsNodeImpl::AppendEntries(::google::protobuf::RpcController* /*controller*
                     "length: %ld,%ld", 
                     old_length, request->prev_log_index());
             }
+            mu_.Unlock();
             binlogger_->AppendEntryList(request->entries());
+            mu_.Lock();
         }
         int64_t old_commit_index = commit_index_;
         commit_index_ = std::min(binlogger_->GetLength() - 1,
@@ -652,6 +733,17 @@ void InsNodeImpl::AppendEntries(::google::protobuf::RpcController* /*controller*
         LOG(FATAL, "invalid status: %d", status_);
         abort();
     }
+    return;
+}
+
+void InsNodeImpl::AppendEntries(::google::protobuf::RpcController* /*controller*/,
+                                const ::galaxy::ins::AppendEntriesRequest* request,
+                                ::galaxy::ins::AppendEntriesResponse* response,
+                                ::google::protobuf::Closure* done) {
+    follower_worker_.AddTask(
+        boost::bind(&InsNodeImpl::DoAppendEntries, this,
+                    request, response, done)
+    );
     return;
 }
 
@@ -775,12 +867,14 @@ void InsNodeImpl::ReplicateLog(std::string follower_id) {
             bool slot_ok = binlogger_->ReadSlot(idx, &log_entry);
             if (!slot_ok) {
                 has_bad_slot = true;
+                break;
             }
             galaxy::ins::Entry * entry = request.add_entries();
             entry->set_term(log_entry.term);
             entry->set_key(log_entry.key);
             entry->set_value(log_entry.value);
             entry->set_op(log_entry.op);
+            entry->set_user(log_entry.user);
             max_term = std::max(max_term, log_entry.term);
         }
         if (has_bad_slot) {
@@ -792,7 +886,7 @@ void InsNodeImpl::ReplicateLog(std::string follower_id) {
                                           &InsNode_Stub::AppendEntries,
                                           &request,
                                           &response,
-                                          5, 1);
+                                          60, 1);
         mu_.Lock();
         mu_.AssertHeld();
         if (ok && response.current_term() > current_term_) {
@@ -810,9 +904,14 @@ void InsNodeImpl::ReplicateLog(std::string follower_id) {
                 if (max_term == current_term_) {
                     UpdateCommitIndex(index + batch_span - 1);
                 }
+            } else if (response.is_busy()) {
+                mu_.Unlock();
+                LOG(FATAL, "delay replicate-rpc to %s , [busy]", 
+                    follower_id.c_str());
+                ThisThread::Sleep(FLAGS_replication_retry_timespan);
+                mu_.Lock();
             } else { // (index, term ) miss match
-                next_index_[follower_id] -= 1;
-                next_index_[follower_id] = std::min(next_index_[follower_id],
+                next_index_[follower_id] = std::min(next_index_[follower_id] - 1,
                                                     response.log_length());
                 LOG(INFO, "adjust next_index of %s to %ld",
                     follower_id.c_str(), 
@@ -836,6 +935,7 @@ void InsNodeImpl::Get(::google::protobuf::RpcController* /*controller*/,
                       const ::galaxy::ins::GetRequest* request,
                       ::galaxy::ins::GetResponse* response,
                       ::google::protobuf::Closure* done) {
+    perform_.Get();
     MutexLock lock(&mu_);
     if (status_ == kFollower) {
         response->set_hit(false);
@@ -858,6 +958,16 @@ void InsNodeImpl::Get(::google::protobuf::RpcController* /*controller*/,
         response->set_hit(false);
         response->set_leader_id("");
         response->set_success(false);
+        done->Run();
+        return;
+    }
+
+    const std::string& uuid = request->uuid();
+    if (!uuid.empty() && !user_manager_->IsLoggedIn(uuid)) {
+        response->set_hit(false);
+        response->set_leader_id("");
+        response->set_success(false);
+        response->set_uuid_expired(true);
         done->Run();
         return;
     }
@@ -898,26 +1008,25 @@ void InsNodeImpl::Get(::google::protobuf::RpcController* /*controller*/,
     } else {
         mu_.Unlock();
         std::string key = request->key();
-        leveldb::Status s;
+        Status s;
         std::string value;
-        s = data_store_->Get(leveldb::ReadOptions(), key, &value);
+        s = data_store_->Get(user_manager_->GetUsernameFromUuid(uuid), key, &value);
         std::string real_value;
         LogOperation op;
         ParseValue(value, op, real_value);
-        if (s.ok()) {
+        if (s == kOk) {
             if (op == kLock) {
                 if (IsExpiredSession(real_value)) {
                     response->set_hit(false);
                     response->set_success(true);
                     response->set_leader_id("");
-                } else{
+                } else {
                     response->set_hit(true);
                     response->set_success(true);
                     response->set_value(real_value);
                     response->set_leader_id("");
                 }
-            }
-            else {
+            } else {
                 response->set_hit(true);
                 response->set_success(true);
                 response->set_value(real_value);
@@ -938,6 +1047,7 @@ void InsNodeImpl::Delete(::google::protobuf::RpcController* /*controller*/,
                         const ::galaxy::ins::DelRequest* request,
                         ::galaxy::ins::DelResponse* response,
                         ::google::protobuf::Closure* done) {
+    perform_.Delete();
     MutexLock lock(&mu_);
     if (status_ == kFollower) {
         response->set_success(false);
@@ -953,9 +1063,19 @@ void InsNodeImpl::Delete(::google::protobuf::RpcController* /*controller*/,
         return;
     }
 
+    const std::string& uuid = request->uuid();
+    if (!uuid.empty() && !user_manager_->IsLoggedIn(uuid)) {
+        response->set_success(false);
+        response->set_leader_id("");
+        response->set_uuid_expired(true);
+        done->Run();
+        return;
+    }
+
     const std::string& key = request->key();
     LOG(DEBUG, "client want delete key :%s", key.c_str());
     LogEntry log_entry;
+    log_entry.user = user_manager_->GetUsernameFromUuid(uuid);
     log_entry.key = key;
     log_entry.value = "";
     log_entry.term = current_term_;
@@ -976,6 +1096,7 @@ void InsNodeImpl::Put(::google::protobuf::RpcController* /*controller*/,
                       const ::galaxy::ins::PutRequest* request,
                       ::galaxy::ins::PutResponse* response,
                       ::google::protobuf::Closure* done) {
+    perform_.Put();
     MutexLock lock(&mu_);
     if (status_ == kFollower) {
         response->set_success(false);
@@ -991,10 +1112,28 @@ void InsNodeImpl::Put(::google::protobuf::RpcController* /*controller*/,
         return;
     }
 
+    if (client_ack_.size() > static_cast<size_t>(FLAGS_max_write_pending)) {
+        LOG(WARNING, "write pending size: %d", client_ack_.size());
+        response->set_success(false);
+        response->set_leader_id("");
+        done->Run();
+        return;
+    }
+
+    const std::string& uuid = request->uuid();
+    if (!uuid.empty() && !user_manager_->IsLoggedIn(uuid)) {
+        response->set_success(false);
+        response->set_leader_id("");
+        response->set_uuid_expired(true);
+        done->Run();
+        return;
+    }
+    
     const std::string& key = request->key();
     const std::string& value = request->value();
     LOG(DEBUG, "client want put key :%s", key.c_str());
     LogEntry log_entry;
+    log_entry.user = user_manager_->GetUsernameFromUuid(uuid);
     log_entry.key = key;
     log_entry.value = value;
     log_entry.term = current_term_;
@@ -1011,25 +1150,26 @@ void InsNodeImpl::Put(::google::protobuf::RpcController* /*controller*/,
     return;
 }
 
-bool InsNodeImpl::LockIsAvilable(const std::string& key, 
-                                 const std::string& session_id) {
-    leveldb::Status s;
+bool InsNodeImpl::LockIsAvailable(const std::string& user,
+                                  const std::string& key,
+                                  const std::string& session_id) {
+    Status s;
     std::string old_locker_session;
     std::string value;
     LogOperation op;
-    s = data_store_->Get(leveldb::ReadOptions(), key, &value);
+    s = data_store_->Get(user, key, &value);
     ParseValue(value, op, old_locker_session);
-    bool lock_is_avilable = false;
-    if (!s.ok()) {
+    bool lock_is_available = false;
+    if (s != kOk) {
         MutexLock lock(&sessions_mu_);
         SessionIDIndex& id_index = sessions_.get<0>();
         SessionIDIndex::iterator self_it = id_index.find(session_id);
         if (self_it != sessions_.end()) {
-            lock_is_avilable = true;
+            lock_is_available = true;
         }
     } else {
         if (op != kLock) {
-            lock_is_avilable = false;
+            lock_is_available = false;
         } else {
             MutexLock lock(&sessions_mu_);
             SessionIDIndex& id_index = sessions_.get<0>();
@@ -1037,18 +1177,18 @@ bool InsNodeImpl::LockIsAvilable(const std::string& key,
             SessionIDIndex::iterator self_it = id_index.find(session_id);
             if (old_it == sessions_.end() //expired session
                 && self_it != sessions_.end()) { 
-                lock_is_avilable = true;
+                lock_is_available = true;
             }
         }
     }
-    return lock_is_avilable;
+    return lock_is_available;
 }
 
-void InsNodeImpl::Lock(::google::protobuf::RpcController* controller,
+void InsNodeImpl::Lock(::google::protobuf::RpcController* /*controller*/,
                        const ::galaxy::ins::LockRequest* request,
                        ::galaxy::ins::LockResponse* response,
                        ::google::protobuf::Closure* done) {
-    (void) controller;
+    perform_.Lock();
     MutexLock lock(&mu_);
     if (status_ == kFollower) {
         response->set_success(false);
@@ -1064,6 +1204,15 @@ void InsNodeImpl::Lock(::google::protobuf::RpcController* controller,
         return;
     }
 
+    const std::string& uuid = request->uuid();
+    if (!uuid.empty() && !user_manager_->IsLoggedIn(uuid)) {
+        response->set_success(false);
+        response->set_leader_id("");
+        response->set_uuid_expired(true);
+        done->Run();
+        return;
+    }
+
     if (status_ == kLeader && in_safe_mode_) {
         LOG(INFO, "leader is still in safe mode");
         response->set_leader_id("");
@@ -1074,7 +1223,7 @@ void InsNodeImpl::Lock(::google::protobuf::RpcController* controller,
 
     int64_t tm_now = ins_common::timer::get_micros();
     if (status_ == kLeader && 
-        (tm_now - leader_start_timestamp_) < FLAGS_session_expire_timeout) {
+        (tm_now - server_start_timestamp_) < FLAGS_session_expire_timeout) {
         LOG(INFO, "leader is still in safe mode for lock");
         response->set_leader_id("");
         response->set_success(false);
@@ -1084,23 +1233,24 @@ void InsNodeImpl::Lock(::google::protobuf::RpcController* controller,
 
     const std::string& key = request->key();
     const std::string& session_id = request->session_id();
+    const std::string& user = user_manager_->GetUsernameFromUuid(uuid);
     LogEntry log_entry;
+    log_entry.user = user;
     log_entry.key = key;
     log_entry.value = session_id;
     log_entry.term = current_term_;
     log_entry.op = kLock;
-    bool lock_is_avilable = false;
-    lock_is_avilable = LockIsAvilable(key, session_id);
-    if (lock_is_avilable) {
+    bool lock_is_available = false;
+    lock_is_available = LockIsAvailable(user, key, session_id);
+    if (lock_is_available) {
         LOG(INFO, "lock key :%s, session:%s",
                    key.c_str(),
                    session_id.c_str());
         std::string type_and_value;
         type_and_value.append(1, static_cast<char>(kLock));
         type_and_value.append(session_id);
-        leveldb::Status st = data_store_->Put(leveldb::WriteOptions(),
-                                              key, type_and_value);
-        assert(st.ok());
+        Status st = data_store_->Put(user, key, type_and_value);
+        assert(st == kOk);
         binlogger_->AppendEntry(log_entry);
         int64_t cur_index = binlogger_->GetLength() - 1;
         ClientAck& ack = client_ack_[cur_index];
@@ -1120,62 +1270,80 @@ void InsNodeImpl::Lock(::google::protobuf::RpcController* controller,
     return;
 }
 
-void InsNodeImpl::Scan(::google::protobuf::RpcController* controller,
+void InsNodeImpl::Scan(::google::protobuf::RpcController* /*controller*/,
                        const ::galaxy::ins::ScanRequest* request,
                        ::galaxy::ins::ScanResponse* response,
                        ::google::protobuf::Closure* done) {
-    (void) controller;
-    MutexLock lock(&mu_);
-    if (status_ == kFollower) {
-        response->set_leader_id(current_leader_);
-        response->set_success(false);
-        done->Run();
-        return;
+    perform_.Scan();
+    const std::string& uuid = request->uuid();
+    {
+        MutexLock lock(&mu_);
+        if (status_ == kFollower) {
+            response->set_leader_id(current_leader_);
+            response->set_success(false);
+            done->Run();
+            return;
+        }
+
+        if (status_ == kCandidate) {
+            response->set_leader_id("");
+            response->set_success(false);
+            done->Run();
+            return;
+        }
+
+        if (!uuid.empty() && !user_manager_->IsLoggedIn(uuid)) {
+            response->set_success(false);
+            response->set_leader_id("");
+            response->set_uuid_expired(true);
+            done->Run();
+            return;
+        }
+
+        if (status_ == kLeader && in_safe_mode_) {
+            LOG(INFO, "leader is still in safe mode");
+            response->set_leader_id("");
+            response->set_success(false);
+            done->Run();
+            return;
+        }
+
+        int64_t tm_now = ins_common::timer::get_micros();
+        if (status_ == kLeader &&
+                (tm_now - server_start_timestamp_) < FLAGS_session_expire_timeout) {
+            LOG(INFO, "leader is still in safe mode for scan");
+            response->set_leader_id("");
+            response->set_success(false);
+            done->Run();
+            return;
+        }
     }
 
-    if (status_ == kCandidate) {
-        response->set_leader_id("");
-        response->set_success(false);
-        done->Run();
-        return;
-    }
-
-    if (status_ == kLeader && in_safe_mode_) {
-        LOG(INFO, "leader is still in safe mode");
-        response->set_leader_id("");
-        response->set_success(false);
-        done->Run();
-        return;
-    }
-
-    int64_t tm_now = ins_common::timer::get_micros();
-    if (status_ == kLeader &&
-        (tm_now - leader_start_timestamp_) < FLAGS_session_expire_timeout) {
-        LOG(INFO, "leader is still in safe mode for scan");
-        response->set_leader_id("");
-        response->set_success(false);
-        done->Run();
-        return;
-    }
-
-    mu_.Unlock();
-    std::string start_key = request->start_key();
-    std::string end_key = request->end_key();
+    const std::string& start_key = request->start_key();
+    const std::string& end_key = request->end_key();
     int32_t size_limit = request->size_limit();
-    leveldb::Iterator* it = data_store_->NewIterator(leveldb::ReadOptions());
+    StorageManager::Iterator* it = data_store_->NewIterator(
+            user_manager_->GetUsernameFromUuid(uuid));
+    if (it == NULL) {
+        response->set_uuid_expired(true);
+        response->set_success(true);
+        done->Run();
+        mu_.Lock();
+        return;
+    }
     bool has_more = false;
     int32_t count = 0;
     for (it->Seek(start_key);
-         it->Valid() && (it->key().ToString() < end_key || end_key.empty());
+         it->Valid() && (it->key() < end_key || end_key.empty());
          it->Next()) {
         if (count > size_limit) {
             has_more = true;
             break;
         }
-        if (it->key().ToString() == tag_last_applied_index) {
+        if (it->key() == tag_last_applied_index) {
             continue;
         }
-        std::string value = it->value().ToString();
+        const std::string& value = it->value();
         std::string real_value;
         LogOperation op;
         ParseValue(value, op, real_value);
@@ -1186,36 +1354,34 @@ void InsNodeImpl::Scan(::google::protobuf::RpcController* controller,
             }
         }
         galaxy::ins::ScanItem* item = response->add_items();
-        item->set_key(it->key().ToString());
+        item->set_key(it->key());
         item->set_value(real_value);
         count ++;
     }
 
-    assert(it->status().ok());
+    assert(it->status() == kOk);
     delete it;
     response->set_has_more(has_more);
     response->set_success(true);
     done->Run();
-
-    mu_.Lock();    
     return;
 }
 
-void InsNodeImpl::KeepAlive(::google::protobuf::RpcController* controller,
+void InsNodeImpl::KeepAlive(::google::protobuf::RpcController* /*controller*/,
                             const ::galaxy::ins::KeepAliveRequest* request,
                             ::galaxy::ins::KeepAliveResponse* response,
                             ::google::protobuf::Closure* done) {
-    (void) controller;
+    perform_.KeepAlive();
     {
         MutexLock lock(&mu_);
-        if (status_ == kFollower) {
+        if (status_ == kFollower && !request->forward_from_leader()) {
             response->set_success(false);
             response->set_leader_id(current_leader_);
             done->Run();
             return;
         }
 
-        if (status_ == kCandidate) {
+        if (status_ == kCandidate && !request->forward_from_leader()) {
             response->set_success(false);
             response->set_leader_id("");
             done->Run();
@@ -1225,7 +1391,7 @@ void InsNodeImpl::KeepAlive(::google::protobuf::RpcController* controller,
     Session session;
     session.session_id = request->session_id();
     session.last_report_time = ins_common::timer::get_micros();
-    session.host_name = request->host_name();
+    session.uuid = request->uuid();
     {
         MutexLock lock(&sessions_mu_);
         SessionIDIndex& id_index = sessions_.get<0>();
@@ -1246,7 +1412,49 @@ void InsNodeImpl::KeepAlive(::google::protobuf::RpcController* controller,
     response->set_success(true);
     response->set_leader_id("");
     LOG(DEBUG, "recv session id: %s", session.session_id.c_str());
+    //forward heartbeat of clients
+    ForwardKeepAlive(request, response);
     done->Run();
+}
+
+void InsNodeImpl::ForwardKeepAlive(const ::galaxy::ins::KeepAliveRequest * request,
+                                   ::galaxy::ins::KeepAliveResponse * response) {
+    std::vector<std::string> followers;
+    {
+        MutexLock lock(&mu_);
+        if (status_ != kLeader) {
+            return;
+        }
+        std::vector<std::string>::iterator it = members_.begin();
+        for(; it!= members_.end(); it++) {
+            if (*it == self_id_) {
+                continue;
+            }
+            followers.push_back(*it);
+        }
+    }
+    std::vector<std::string>::iterator it;
+    for (it = followers.begin(); it != followers.end(); it++) {
+        InsNode_Stub* stub;
+        rpc_client_.GetStub(*it, &stub);
+        boost::scoped_ptr<galaxy::ins::InsNode_Stub> stub_guard(stub);
+        ::galaxy::ins::KeepAliveRequest* forward_request = 
+            new ::galaxy::ins::KeepAliveRequest();
+        ::galaxy::ins::KeepAliveResponse* forward_response =
+            new ::galaxy::ins::KeepAliveResponse();
+        forward_request->CopyFrom(*request);
+        forward_response->CopyFrom(*response);
+        forward_request->set_forward_from_leader(true);
+        boost::function<void (const ::galaxy::ins::KeepAliveRequest*,
+                        ::galaxy::ins::KeepAliveResponse*,
+                        bool, int) > callback;
+        callback = boost::bind(&InsNodeImpl::ForwardKeepAliveCallback,
+                               this,
+                               _1, _2, _3, _4);
+        rpc_client_.AsyncRequest(stub, &InsNode_Stub::KeepAlive, 
+                                 forward_request, 
+                                 forward_response, callback, 2, 1);
+    }
 }
 
 void InsNodeImpl::RemoveExpiredSessions() {
@@ -1261,7 +1469,7 @@ void InsNodeImpl::RemoveExpiredSessions() {
         cur_status = status_;
     }
 
-    std::vector<std::string> expired_sessions;
+    std::vector<Session> expired_sessions;
  
     {
         MutexLock lock_session(&sessions_mu_);
@@ -1274,7 +1482,7 @@ void InsNodeImpl::RemoveExpiredSessions() {
                 LOG(INFO, "remove expired session");
                 for (SessionTimeIndex::iterator dd = time_index.begin();
                      dd != it; dd++) {
-                    expired_sessions.push_back(dd->session_id);
+                    expired_sessions.push_back(*dd);
                     LOG(INFO, "remove session_id %s", dd->session_id.c_str());
                 }
                 time_index.erase(time_index.begin(), it);
@@ -1284,47 +1492,61 @@ void InsNodeImpl::RemoveExpiredSessions() {
 
     {
         MutexLock lock_watch(&watch_mu_);
-        std::vector<std::string>::iterator it = expired_sessions.begin();
+        std::vector<Session>::iterator it = expired_sessions.begin();
         for ( ; it != expired_sessions.end(); it++){
-            RemoveEventBySession(*it);
+            RemoveEventBySession(it->session_id);
         }
     }
 
-    std::vector<std::pair<std::string, std::string> > unlock_keys;
+    std::vector<std::pair<std::string, Session> > unlock_keys;
 
     {
         MutexLock lock_sk(&session_locks_mu_);
-        std::vector<std::string>::iterator it = expired_sessions.begin();
+        std::vector<Session>::iterator it = expired_sessions.begin();
         for ( ; it != expired_sessions.end(); it++){
-            std::string session_id = *it;
+            const std::string& session_id = it->session_id;
+            const std::string& uuid = it->uuid;
             if (session_locks_.find(session_id) != session_locks_.end()) {
                 std::set<std::string>& keys = session_locks_[session_id];
                 std::set<std::string>::iterator jt = keys.begin();
                 for(; jt != keys.end(); jt++) {
-                    unlock_keys.push_back(std::make_pair(*jt, session_id));
+                    unlock_keys.push_back(std::make_pair(*jt, Session(session_id, uuid)));
                 }
                 session_locks_.erase(session_id);
             }
-        }      
+        }
     }
 
     if (cur_status == kLeader) {
         for (size_t i = 0; i < unlock_keys.size(); i++){
-            std::string key = unlock_keys[i].first;
-            std::string session_id = unlock_keys[i].second;
+            const std::string& key = unlock_keys[i].first;
+            const std::string& session_id = unlock_keys[i].second.session_id;
+            const std::string& uuid = unlock_keys[i].second.uuid;
             LogEntry log_entry;
+            log_entry.user = user_manager_->GetUsernameFromUuid(uuid);
             log_entry.key = key;
             log_entry.value = session_id;
             log_entry.term = cur_term;
             log_entry.op = kUnLock;
-            binlogger_->AppendEntry(log_entry);   
+            binlogger_->AppendEntry(log_entry);
+        }
+        for (std::vector<Session>::iterator it = expired_sessions.begin();
+             it != expired_sessions.end(); ++it) {
+            const std::string& uuid = it->uuid;
+            if (!uuid.empty()) {
+                LogEntry log_entry;
+                log_entry.user = uuid;
+                log_entry.term = cur_term;
+                log_entry.op = kLogout;
+                binlogger_->AppendEntry(log_entry);
+            }
         }
         if (single_node_mode_) { //single node cluster
             MutexLock lock(&mu_);
             UpdateCommitIndex(binlogger_->GetLength() - 1);
         }
     }
-    session_checker_.DelayTask(2000, 
+    session_checker_.DelayTask(2000,
         boost::bind(&InsNodeImpl::RemoveExpiredSessions, this)
     );
 }
@@ -1378,8 +1600,8 @@ void InsNodeImpl::TriggerEvent(const std::string& watch_key,
         int event_count = 0;
         for (WatchEventKeyIndex::iterator it = it_start;
              it != it_end; it++) {
-            it->ack->response->set_watch_key(watch_key);
-            it->ack->response->set_key(key);
+            it->ack->response->set_watch_key(GetKeyFromEvent(watch_key));
+            it->ack->response->set_key(GetKeyFromEvent(key));
             it->ack->response->set_value(value);
             it->ack->response->set_deleted(deleted);
             it->ack->response->set_success(true);
@@ -1417,7 +1639,6 @@ void InsNodeImpl::RemoveEventBySessionAndKey(const std::string& session_id,
     }
 }
 
-
 void InsNodeImpl::TriggerEventBySessionAndKey(const std::string& session_id,
                                               const std::string& key,
                                               const std::string& value,
@@ -1434,8 +1655,8 @@ void InsNodeImpl::TriggerEventBySessionAndKey(const std::string& session_id,
             if (it->key == key) {
                 LOG(INFO, "trigger watch event: %s on %s",
                            it->key.c_str(), it->session_id.c_str());
-                it->ack->response->set_watch_key(key);
-                it->ack->response->set_key(key);
+                it->ack->response->set_watch_key(GetKeyFromEvent(key));
+                it->ack->response->set_key(GetKeyFromEvent(key));
                 it->ack->response->set_value(value);
                 it->ack->response->set_deleted(deleted);
                 it->ack->response->set_success(true);
@@ -1465,11 +1686,11 @@ void InsNodeImpl::RemoveEventBySession(const std::string& session_id) {
     }
 }
 
-void InsNodeImpl::Watch(::google::protobuf::RpcController* controller,
+void InsNodeImpl::Watch(::google::protobuf::RpcController* /*controller*/,
                         const ::galaxy::ins::WatchRequest* request,
                         ::galaxy::ins::WatchResponse* response,
                         ::google::protobuf::Closure* done) {
-    (void) controller;
+    perform_.Watch();
     {
         MutexLock lock(&mu_);
         if (status_ == kFollower) {
@@ -1486,25 +1707,36 @@ void InsNodeImpl::Watch(::google::protobuf::RpcController* controller,
             return;
         } 
     }
+
+    const std::string& uuid = request->uuid();
+    if (!uuid.empty() && !user_manager_->IsLoggedIn(uuid)) {
+        response->set_success(false);
+        response->set_leader_id("");
+        response->set_uuid_expired(true);
+        done->Run();
+        return;
+    }
     
     WatchAck::Ptr ack_obj(new WatchAck(response, done));
     
-    std::string key = request->key();
+    const std::string& key = request->key();
+    const std::string& bindedkey = BindKeyAndUser(
+            user_manager_->GetUsernameFromUuid(uuid), key);
     {
         MutexLock lock(&watch_mu_);
         WatchEvent watch_event;
-        watch_event.key = key;
+        watch_event.key = bindedkey;
         watch_event.session_id = request->session_id();
         watch_event.ack = ack_obj;
         RemoveEventBySessionAndKey(watch_event.session_id, watch_event.key);
         watch_events_.insert(watch_event);
     }
     int64_t tm_now = ins_common::timer::get_micros(); 
-    if (tm_now - leader_start_timestamp_ > FLAGS_session_expire_timeout) {
-        leveldb::Status s;
+    if (tm_now - server_start_timestamp_ > FLAGS_session_expire_timeout) {
+        Status s;
         std::string raw_value;
-        s = data_store_->Get(leveldb::ReadOptions(), key, &raw_value);
-        bool key_exist = s.ok();
+        s = data_store_->Get(user_manager_->GetUsernameFromUuid(uuid), key, &raw_value);
+        bool key_exist = (s == kOk);
         std::string real_value;
         LogOperation op;
         ParseValue(raw_value, op, real_value);
@@ -1513,12 +1745,12 @@ void InsNodeImpl::Watch(::google::protobuf::RpcController* controller,
             LOG(INFO, "key:%s, new_v: %s, old_v:%s", 
                 key.c_str(), real_value.c_str(), request->old_value().c_str());
             TriggerEventBySessionAndKey(request->session_id(),
-                                        key, real_value, s.IsNotFound());
+                                        bindedkey, real_value, (s == kNotFound));
         } else if (op == kLock && IsExpiredSession(real_value)) {
             LOG(INFO, "key(lock):%s, new_v: %s, old_v:%s", 
                 key.c_str(), real_value.c_str(), request->old_value().c_str());
             TriggerEventBySessionAndKey(request->session_id(),
-                                        key, "", true);
+                                        bindedkey, "", true);
         }
     }
 }
@@ -1527,6 +1759,7 @@ void InsNodeImpl::UnLock(::google::protobuf::RpcController* /*controller*/,
                          const ::galaxy::ins::UnLockRequest* request,
                          ::galaxy::ins::UnLockResponse* response,
                          ::google::protobuf::Closure* done) {
+    perform_.Unlock();
     MutexLock lock(&mu_);
     if (status_ == kFollower) {
         response->set_success(false);
@@ -1542,10 +1775,20 @@ void InsNodeImpl::UnLock(::google::protobuf::RpcController* /*controller*/,
         return;
     }
 
+    const std::string& uuid = request->uuid();
+    if (!uuid.empty() && !user_manager_->IsLoggedIn(uuid)) {
+        response->set_success(false);
+        response->set_leader_id("");
+        response->set_uuid_expired(true);
+        done->Run();
+        return;
+    }
+
     const std::string& key = request->key();
     const std::string& session_id = request->session_id();
     LOG(DEBUG, "client want unlock key :%s", key.c_str());
     LogEntry log_entry;
+    log_entry.user = user_manager_->GetUsernameFromUuid(uuid);
     log_entry.key = key;
     log_entry.value = session_id;
     log_entry.term = current_term_;
@@ -1562,9 +1805,139 @@ void InsNodeImpl::UnLock(::google::protobuf::RpcController* /*controller*/,
     return;
 }
 
+void InsNodeImpl::Login(::google::protobuf::RpcController* /*controller*/,
+                        const ::galaxy::ins::LoginRequest* request,
+                        ::galaxy::ins::LoginResponse* response,
+                        ::google::protobuf::Closure* done) {
+    MutexLock lock(&mu_);
+    if (status_ == kFollower) {
+        response->set_status(kError);
+        response->set_leader_id(current_leader_);
+        done->Run();
+        return;
+    }
+
+    if (status_ == kCandidate) {
+        response->set_status(kError);
+        response->set_leader_id("");
+        done->Run();
+        return;
+    }
+
+    const std::string& username = request->username();
+    if (!user_manager_->IsValidUser(username)) {
+        response->set_status(kUnknownUser);
+        response->set_leader_id("");
+        done->Run();
+        return;
+    }
+
+    const std::string& passwd = request->passwd();
+    LOG(DEBUG, "client wants to login :%s", username.c_str());
+    LogEntry log_entry;
+    log_entry.user = UserManager::CalcUuid(username);
+    LOG(DEBUG, "now calc uuid :%s", log_entry.user.c_str());
+    log_entry.key = username;
+    log_entry.value = passwd;
+    log_entry.term = current_term_;
+    log_entry.op = kLogin;
+    binlogger_->AppendEntry(log_entry);
+    int64_t cur_index = binlogger_->GetLength() - 1;
+    ClientAck& ack = client_ack_[cur_index];
+    ack.done = done;
+    ack.login_response = response;
+    replication_cond_->Broadcast();
+    if (single_node_mode_) {
+        UpdateCommitIndex(binlogger_->GetLength() - 1);
+    }
+    return;
+}
+
+void InsNodeImpl::Logout(::google::protobuf::RpcController* /*controller*/,
+                         const ::galaxy::ins::LogoutRequest* request,
+                         ::galaxy::ins::LogoutResponse* response,
+                         ::google::protobuf::Closure* done) {
+    MutexLock lock(&mu_);
+    if (status_ == kFollower) {
+        response->set_status(kError);
+        response->set_leader_id(current_leader_);
+        done->Run();
+        return;
+    }
+
+    if (status_ == kCandidate) {
+        response->set_status(kError);
+        response->set_leader_id("");
+        done->Run();
+        return;
+    }
+
+    const std::string& uuid = request->uuid();
+    if (!uuid.empty() && !user_manager_->IsLoggedIn(uuid)) {
+        response->set_status(kUnknownUser);
+        response->set_leader_id("");
+        done->Run();
+        return;
+    }
+
+    LOG(DEBUG, "client wants to logout :%s", uuid.c_str());
+    LogEntry log_entry;
+    log_entry.user = uuid;
+    log_entry.term = current_term_;
+    log_entry.op = kLogout;
+    binlogger_->AppendEntry(log_entry);
+    int64_t cur_index = binlogger_->GetLength() - 1;
+    ClientAck& ack = client_ack_[cur_index];
+    ack.done = done;
+    ack.logout_response = response;
+    replication_cond_->Broadcast();
+    if (single_node_mode_) {
+        UpdateCommitIndex(binlogger_->GetLength() - 1);
+    }
+    return;
+}
+
+void InsNodeImpl::Register(::google::protobuf::RpcController* /*controller*/,
+                           const ::galaxy::ins::RegisterRequest* request,
+                           ::galaxy::ins::RegisterResponse* response,
+                           ::google::protobuf::Closure* done) {
+    MutexLock lock(&mu_);
+    if (status_ == kFollower) {
+        response->set_status(kError);
+        response->set_leader_id(current_leader_);
+        done->Run();
+        return;
+    }
+
+    if (status_ == kCandidate) {
+        response->set_status(kError);
+        response->set_leader_id("");
+        done->Run();
+        return;
+    }
+
+    const std::string& username = request->username();
+    const std::string& password = request->passwd();
+    LOG(DEBUG, "client wants to register :%s", username.c_str());
+    LogEntry log_entry;
+    log_entry.key = username;
+    log_entry.value = password;
+    log_entry.term = current_term_;
+    log_entry.op = kRegister;
+    binlogger_->AppendEntry(log_entry);
+    int64_t cur_index = binlogger_->GetLength() - 1;
+    ClientAck& ack = client_ack_[cur_index];
+    ack.done = done;
+    ack.register_response = response;
+    replication_cond_->Broadcast();
+    if (single_node_mode_) {
+        UpdateCommitIndex(binlogger_->GetLength() - 1);
+    }
+    return;
+}
 
 void InsNodeImpl::DelBinlog(int64_t index) {
-    LOG(INFO, "delete binlog [%ld]", index);
+    LOG(DEBUG, "delete binlog [%ld]", index);
     bool ret = binlogger_->RemoveSlot(index);
     if (ret) {
         binlog_cleaner_.DelayTask(10, //10ms delay
@@ -1576,11 +1949,10 @@ void InsNodeImpl::DelBinlog(int64_t index) {
     }
 }
 
-void InsNodeImpl::CleanBinlog(::google::protobuf::RpcController* controller,
+void InsNodeImpl::CleanBinlog(::google::protobuf::RpcController* /*controller*/,
                               const ::galaxy::ins::CleanBinlogRequest* request,
                               ::galaxy::ins::CleanBinlogResponse* response,
                               ::google::protobuf::Closure* done) {
-    (void)controller;
     int64_t del_end_index = request->end_index();
     {
         MutexLock lock(&mu_);
@@ -1597,6 +1969,128 @@ void InsNodeImpl::CleanBinlog(::google::protobuf::RpcController* controller,
     );
     response->set_success(true);
     done->Run();
+}
+
+void InsNodeImpl::RpcStat(::google::protobuf::RpcController* /*controller*/,
+                          const ::galaxy::ins::RpcStatRequest* request,
+                          ::galaxy::ins::RpcStatResponse* response,
+                          ::google::protobuf::Closure* done) {
+    std::vector<int> stats;
+    if (request->op_size() == 0) {
+        for (int i = 1; i <= 8; ++i) {
+            stats.push_back(i);
+        }
+    } else {
+        stats.resize(request->op_size());
+        std::copy(request->op().begin(), request->op().end(), stats.begin());
+    }
+    for (std::vector<int>::iterator it = stats.begin(); it != stats.end(); ++it) {
+        int64_t current_stat = 0l;
+        int64_t average_stat = 0l;
+        switch (StatOperation(*it)) {
+        case kPutOp:
+            current_stat = perform_.CurrentPut();
+            average_stat = perform_.AveragePut();
+            break;
+        case kGetOp:
+            current_stat = perform_.CurrentGet();
+            average_stat = perform_.AverageGet();
+            break;
+        case kDeleteOp:
+            current_stat = perform_.CurrentDelete();
+            average_stat = perform_.AverageDelete();
+            break;
+        case kScanOp:
+            current_stat = perform_.CurrentScan();
+            average_stat = perform_.AverageScan();
+            break;
+        case kKeepAliveOp:
+            current_stat = perform_.CurrentKeepAlive();
+            average_stat = perform_.AverageKeepAlive();
+            break;
+        case kLockOp:
+            current_stat = perform_.CurrentLock();
+            average_stat = perform_.AverageLock();
+            break;
+        case kUnlockOp:
+            current_stat = perform_.CurrentUnlock();
+            average_stat = perform_.AverageUnlock();
+            break;
+        case kWatchOp:
+            current_stat = perform_.CurrentWatch();
+            average_stat = perform_.AverageWatch();
+            break;
+        default: break;
+        }
+        StatInfo* stat = response->add_stats();
+        stat->set_current_stat(current_stat);
+        stat->set_average_stat(average_stat);
+    }
+    response->set_status(status_);
+    done->Run();
+}
+
+void InsNodeImpl::GarbageClean() {
+    std::vector<std::string> all_members;
+    bool is_leader = false;
+    {
+        MutexLock lock(&mu_);
+        if (status_ == kLeader) {
+            is_leader = true;
+        }
+        std::copy(members_.begin(), members_.end(), std::back_inserter(all_members));
+    }
+    if (is_leader) {
+        int64_t min_applied_index = std::numeric_limits<int64_t>::max();
+        bool ret_all = true;
+        std::vector<std::string>::iterator it;
+        for(it = all_members.begin(); it != all_members.end(); it++) {
+            galaxy::ins::InsNode_Stub* stub;
+            std::string server_id = *it;
+            rpc_client_.GetStub(server_id, &stub);
+            boost::scoped_ptr<galaxy::ins::InsNode_Stub> stub_guard(stub);
+            ::galaxy::ins::ShowStatusRequest request;
+            ::galaxy::ins::ShowStatusResponse response;
+            bool ok = rpc_client_.SendRequest(stub, &InsNode_Stub::ShowStatus, 
+                                               &request, &response, 2, 1);
+            if (!ok) {
+                LOG(INFO, "faild to get last_applied_index from %s", server_id.c_str());
+                ret_all = false;
+                break;
+            } else {
+                min_applied_index = std::min(min_applied_index, response.last_applied());
+            }
+        }
+        if (ret_all) {
+            int64_t safe_clean_index = min_applied_index - 1;
+            int64_t old_index;
+            {
+                MutexLock lock(&mu_);
+                old_index = last_safe_clean_index_;
+                last_safe_clean_index_ = safe_clean_index;
+            }
+            if (old_index != safe_clean_index) {
+                LOG(INFO, "[gc] safe clean index is : %ld", safe_clean_index);
+                for(it = all_members.begin(); it != all_members.end(); it++) {
+                    galaxy::ins::InsNode_Stub* stub;
+                    std::string server_id = *it;
+                    rpc_client_.GetStub(server_id, &stub);
+                    boost::scoped_ptr<galaxy::ins::InsNode_Stub> stub_guard(stub);
+                    ::galaxy::ins::CleanBinlogRequest request;
+                    ::galaxy::ins::CleanBinlogResponse response;
+                    request.set_end_index(safe_clean_index);
+                    bool ok = rpc_client_.SendRequest(stub, &InsNode_Stub::CleanBinlog, 
+                                                      &request, &response, 2, 1);
+                    if (!ok) {
+                        LOG(INFO, "failed to clean binlog request to %s", server_id.c_str());
+                    }
+                }
+            }
+        } // end-if, got min_applied_index
+    }// end-if, this node is leader
+
+    binlog_cleaner_.DelayTask(FLAGS_ins_gc_interval * 1000, 
+                              boost::bind(&InsNodeImpl::GarbageClean, this));
 }
 
 } //namespace ins

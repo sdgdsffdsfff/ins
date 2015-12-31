@@ -15,7 +15,7 @@ TEST(BinLogTest, LogEntryDumpLoad) {
     log_entry.term = 1;
     std::string buf;
     bin_logger.DumpLogEntry(log_entry, &buf);
-    EXPECT_EQ(buf.size(), 23u); //#1+4+3+4+3+8
+    EXPECT_EQ(buf.size(), 27u); //#1+4+0+4+3+4+3+8
     std::string buf2 = buf;
     bin_logger.LoadLogEntry(buf2, &log_entry2);
     EXPECT_EQ(log_entry.key, log_entry2.key);
@@ -41,7 +41,7 @@ TEST(BinLogTest, SlotWriteTest) {
 }
 
 TEST(BinLogTest, SlotBatchWriteTest) {
-    BinLogger bin_logger("/tmp/");
+    BinLogger bin_logger("/tmp/", true);
     char key_buf[1024] = {'\0'};
     char value_buf[1024] = {'\0'};
     ::google::protobuf::RepeatedPtrField< ::galaxy::ins::Entry > entries;
